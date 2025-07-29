@@ -19,10 +19,11 @@ import numpy as np
 from gr00t.data.dataset import LeRobotSingleDataset
 from gr00t.model.policy import BasePolicy
 
+from gr00t.utils.g1_plot_helper import * 
+
 # numpy print precision settings 3, dont use exponential notation
 np.set_printoptions(precision=3, suppress=True)
-
-
+    
 def download_from_hg(repo_id: str, repo_type: str) -> str:
     """
     Download the model/dataset from the hugging face hub.
@@ -47,6 +48,11 @@ def calc_mse_for_single_trajectory(
     state_joints_across_time = []
     gt_action_across_time = []
     pred_action_across_time = []
+    
+    joint_names = []
+    
+    for key in modality_keys:
+        joint_names += MODALITY_TO_JOINTS[key]
 
     for step_count in range(steps):
         data_point = dataset.get_step_data(traj_id, step_count)
@@ -106,6 +112,7 @@ def calc_mse_for_single_trajectory(
             "action_dim": action_dim,
             "action_horizon": action_horizon,
             "steps": steps,
+            "joint_names": joint_names,
         }
         plot_trajectory(info, save_plot_path)
 
@@ -131,6 +138,7 @@ def plot_trajectory(
     mse = info["mse"]
     action_horizon = info["action_horizon"]
     steps = info["steps"]
+    joint_names = info["joint_names"]
 
     # Adjust figure size and spacing to accommodate titles
     fig, axes = plt.subplots(nrows=action_dim, ncols=1, figsize=(10, 4 * action_dim + 2))
@@ -154,18 +162,23 @@ def plot_trajectory(
         # The dimensions of state_joints and action are the same only when the robot uses actions directly as joint commands.
         # Therefore, do not plot them if this is not the case.
         if state_joints_across_time.shape == gt_action_across_time.shape:
-            ax.plot(state_joints_across_time[:, i], label="state joints", alpha=0.7)
+            ax.plot(state_joints_across_time[:, i], label="joint state", alpha=0.7)
         ax.plot(gt_action_across_time[:, i], label="gt action", linewidth=2)
         ax.plot(pred_action_across_time[:, i], label="pred action", linewidth=2)
 
         # put a dot every ACTION_HORIZON
         for j in range(0, steps, action_horizon):
             if j == 0:
-                ax.plot(j, gt_action_across_time[j, i], "ro", label="inference point", markersize=6)
+                ax.plot(j, pred_action_across_time[j, i], "ro", label="inference point", markersize=6)
             else:
-                ax.plot(j, gt_action_across_time[j, i], "ro", markersize=4)
+                ax.plot(j, pred_action_across_time[j, i], "ro", markersize=4)
 
-        ax.set_title(f"Action Dimension {i}", fontsize=12, fontweight="bold", pad=10)
+        joint_name = joint_names[i]
+        joint_id = ALL_JOINT_NAMES.index(joint_name)
+        ax.set_title(f"{joint_name}", fontsize=12, fontweight="bold", pad=10)
+        ax.set_ylim(JOINT_LIMITS_LOWER[joint_id]*1.1, JOINT_LIMITS_UPPER[joint_id]*1.1)
+        ax.axhline(JOINT_LIMITS_LOWER[joint_id], color="r", linestyle="-", label="joint limit")
+        ax.axhline(JOINT_LIMITS_UPPER[joint_id], color="r", linestyle="-")
         ax.legend(loc="upper right", framealpha=0.9)
         ax.grid(True, alpha=0.3)
 

@@ -36,6 +36,7 @@ class TrainRunner:
         model: GR00T_N1_5,
         training_args: TrainingArguments,
         train_dataset: LeRobotSingleDataset | LeRobotMixtureDataset,
+        eval_dataset: LeRobotSingleDataset | LeRobotMixtureDataset | None = None,
         resume_from_checkpoint: bool = False,
     ):
         self.training_args = training_args
@@ -44,6 +45,7 @@ class TrainRunner:
         self.exp_cfg_dir.mkdir(parents=True, exist_ok=True)
         self.resume_from_checkpoint = resume_from_checkpoint
         self.train_dataset = train_dataset
+        self.eval_dataset = eval_dataset
         # Set up training arguments
         training_args.run_name = (
             training_args.output_dir.split("/")[-1]
@@ -62,6 +64,7 @@ class TrainRunner:
             model=model,
             training_args=training_args,
             train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
             data_collator=data_collator,
             compute_dtype=compute_dtype,
         )
@@ -125,6 +128,7 @@ class TrainRunner:
         model,
         training_args,
         train_dataset,
+        eval_dataset,
         data_collator,
         compute_dtype,
         global_batch_size=None,
@@ -144,6 +148,7 @@ class TrainRunner:
             model=model,
             args=training_args,
             train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
             data_collator=data_collator,
             compute_dtype=compute_dtype,
         )
@@ -157,12 +162,13 @@ class TrainRunner:
 
         # Log dataloader information
         train_dl_len = len(trainer.get_train_dataloader())
-        # eval_dl_len = len(trainer.get_eval_dataloader()) # @note (k2): How to manage eval dataloader?
+        eval_dl_len = len(trainer.get_eval_dataloader()) # @note (k2): How to manage eval dataloader?
 
         print(
             f"train dataloader length: {train_dl_len}\n"
-            # f"eval dataloader length: {eval_dl_len}\n"
+            f"eval dataloader length: {eval_dl_len}\n"
             f"train dataset length: {len(trainer.train_dataset)}\n"
+            f"eval dataset length: {len(trainer.eval_dataset) if eval_dataset else 0}\n"
             f"GPU memory before training: {torch.cuda.memory_allocated() / 1024 / 1024 / 1024} GB",
             flush=True,
         )

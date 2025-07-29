@@ -19,10 +19,15 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Literal
-
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore', module='torchvision')
 import torch
 import tyro
 from transformers import TrainingArguments
+import numpy as np
+from pathlib import Path
+import json
 
 from gr00t.data.dataset import LeRobotMixtureDataset, LeRobotSingleDataset
 from gr00t.data.schema import EmbodimentTag
@@ -46,8 +51,17 @@ class ArgsConfig:
 
     data_config: Literal[tuple(DATA_CONFIG_MAP.keys())] = "fourier_gr1_arms_only"
     """Data configuration name from DATA_CONFIG_MAP, we assume all datasets have the same data config"""
-
+    
     # Training parameters
+    experiment_name: str = "gr00t_finetune"
+    """Project name for wandb logging"""
+    
+    validation_split: float = 0.1
+    """proportion of data reserved for validation"""
+    
+    eval_steps: int = 500
+    """number of steps between validations"""
+    
     batch_size: int = 32
     """Batch size per GPU for training."""
 
@@ -57,7 +71,7 @@ class ArgsConfig:
     num_gpus: int = 1
     """Number of GPUs to use for training."""
 
-    save_steps: int = 1000
+    save_steps: int = 2500
     """Number of steps between saving checkpoints."""
 
     # Model parameters
@@ -122,6 +136,124 @@ class ArgsConfig:
     balance_trajectory_weights: bool = True
     """Used in LeRobotMixtureDataset. If True, sample trajectories within a dataset weighted by their length; otherwise, equal weighting."""
 
+# helper functions to split the dataset
+
+def split_episodes_by_ratio(trajectory_ids: np.ndarray, val_ratio: float, seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
+    """Split trajectory IDs into train and validation sets by ratio.
+    
+    Args:
+        trajectory_ids: Array of trajectory IDs
+        val_ratio: Ratio of episodes to use for validation (0.0 - 1.0)  
+        seed: Random seed for splitting
+        
+    Returns:
+        tuple of (train_trajectory_ids, val_trajectory_ids)
+    """
+    if val_ratio <= 0.0 or val_ratio >= 1.0:
+        return trajectory_ids, np.array([])
+    
+    rng = np.random.default_rng(seed)
+    shuffled_ids = rng.permutation(trajectory_ids)
+    
+    n_val_episodes = int(len(shuffled_ids) * val_ratio)
+    val_ids = shuffled_ids[:n_val_episodes]
+    train_ids = shuffled_ids[n_val_episodes:]
+    
+    return train_ids, val_ids
+
+
+def create_dataset_subset(dataset: LeRobotSingleDataset, trajectory_ids: np.ndarray) -> LeRobotSingleDataset:
+    """Create a subset of LeRobotSingleDataset with only specified trajectory IDs."""
+    # Create a copy of the dataset with filtered trajectories
+    subset_dataset = LeRobotSingleDataset(
+        dataset_path=dataset.dataset_path,
+        modality_configs=dataset.modality_configs,
+        embodiment_tag=dataset.tag,
+        video_backend=dataset.video_backend,
+        video_backend_kwargs=dataset.video_backend_kwargs,
+        transforms=dataset.transforms,
+    )
+    
+    # Filter trajectories
+    mask = np.isin(subset_dataset._trajectory_ids, trajectory_ids)
+    subset_dataset._trajectory_ids = subset_dataset._trajectory_ids[mask]
+    subset_dataset._trajectory_lengths = subset_dataset._trajectory_lengths[mask]
+    
+    # Rebuild all_steps for the filtered trajectories
+    subset_dataset._all_steps = subset_dataset._get_all_steps()
+    
+    return subset_dataset
+
+
+def split_single_dataset(dataset: LeRobotSingleDataset, val_ratio: float, seed: int = 42,
+                         output_dir: str = "") -> tuple[LeRobotSingleDataset, LeRobotSingleDataset | None]:
+    """Split a single dataset into train and validation sets."""
+    if val_ratio <= 0.0:
+        return dataset, None
+        
+    train_ids, val_ids = split_episodes_by_ratio(dataset.trajectory_ids, val_ratio, seed)
+    
+    train_dataset = create_dataset_subset(dataset, train_ids)
+    val_dataset = create_dataset_subset(dataset, val_ids) if len(val_ids) > 0 else None
+    
+    print(f"Split dataset {dataset.dataset_name}: {len(train_ids)} train episodes, {len(val_ids)} val episodes")
+    
+    # save the val_ids
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    split_info = {
+        "dataset_path": dataset.dataset_path,
+        "total_episodes": len(train_ids) + len(val_ids), 
+        "split_ratio": val_ratio,
+        "val_episodes": val_ids.tolist(),
+        "train_episodes": train_ids.tolist()
+    }
+    with open(output_path / "train_val_split_info.json", "a") as f:
+        json.dump(split_info, f, indent=2)
+    
+    return train_dataset, val_dataset
+
+def split_mixture_dataset(mixture_dataset: LeRobotMixtureDataset, val_ratio: float, seed: int = 42) -> tuple[LeRobotMixtureDataset, LeRobotMixtureDataset | None]:
+    """Split a mixture dataset into train and validation sets."""
+    if val_ratio <= 0.0:
+        return mixture_dataset, None
+    
+    train_datasets = []
+    val_datasets = []
+    dataset_weights = []
+    
+    for dataset, weight in zip(mixture_dataset.datasets, mixture_dataset._dataset_sampling_weights):
+        train_subset, val_subset = split_single_dataset(dataset, val_ratio, seed)
+        train_datasets.append((train_subset, weight))
+        if val_subset is not None:
+            val_datasets.append((val_subset, weight))
+        dataset_weights.append(weight)
+            
+    # Create train mixture dataset
+    train_mixture = LeRobotMixtureDataset(
+        data_mixture=train_datasets,
+        mode="train",
+        balance_dataset_weights=mixture_dataset.balance_dataset_weights,
+        balance_trajectory_weights=mixture_dataset.balance_trajectory_weights,
+        seed=mixture_dataset.seed,
+        metadata_config={"percentile_mixing_method": "weighted_average"}
+    )
+    
+    # Create validation mixture dataset if we have validation data
+    val_mixture = None
+    if val_datasets:
+        val_mixture = LeRobotMixtureDataset(
+            data_mixture=val_datasets,
+            mode="val",
+            balance_dataset_weights=mixture_dataset.balance_dataset_weights,
+            balance_trajectory_weights=mixture_dataset.balance_trajectory_weights,
+            seed=mixture_dataset.seed,
+            metadata_config={"percentile_mixing_method": "weighted_average"}
+        )
+    
+    return train_mixture, val_mixture
+
 
 #####################################################################################
 # main training function
@@ -130,6 +262,8 @@ class ArgsConfig:
 
 def main(config: ArgsConfig):
     """Main training function."""
+    output_dir = config.output_dir + "_" + datetime.now().strftime("%Y%m%d-%H%M%S") + "/"
+    
     # ------------ step 1: load dataset ------------
     embodiment_tag = EmbodimentTag(config.embodiment_tag)
 
@@ -140,13 +274,14 @@ def main(config: ArgsConfig):
 
     # 1.2 data loader: we will use either single dataset or mixture dataset
     if len(config.dataset_path) == 1:
-        train_dataset = LeRobotSingleDataset(
+        full_dataset = LeRobotSingleDataset(
             dataset_path=config.dataset_path[0],
             modality_configs=modality_configs,
             transforms=transforms,
             embodiment_tag=embodiment_tag,  # This will override the dataset's embodiment tag to "new_embodiment"
             video_backend=config.video_backend,
         )
+        train_dataset, val_dataset = split_single_dataset(full_dataset, config.validation_split, output_dir=output_dir)
     else:
         single_datasets = []
         for p in config.dataset_path:
@@ -162,7 +297,7 @@ def main(config: ArgsConfig):
             )
             single_datasets.append(dataset)
 
-        train_dataset = LeRobotMixtureDataset(
+        full_dataset = LeRobotMixtureDataset(
             data_mixture=[
                 (dataset, 1.0)  # we will use equal weights for all datasets
                 for dataset in single_datasets
@@ -176,6 +311,7 @@ def main(config: ArgsConfig):
             },
         )
         print(f"Loaded {len(single_datasets)} datasets, with {config.dataset_path} ")
+        train_dataset, val_dataset = split_mixture_dataset(full_dataset, config.validation_split)
 
     # ------------ step 2: load model ------------
     # First, get the data config to determine action horizon
@@ -189,7 +325,7 @@ def main(config: ArgsConfig):
         tune_projector=config.tune_projector,  # action head's projector
         tune_diffusion_model=config.tune_diffusion_model,  # action head's DiT
     )
-
+ 
     # Update action_horizon to match data config
     # Need to recreate action head with correct config since it was initialized with old config
     if data_action_horizon != model.action_head.config.action_horizon:
@@ -237,11 +373,10 @@ def main(config: ArgsConfig):
             lora_dropout=config.lora_dropout,
             action_head_only=not config.lora_full_model,
         )
-
     # 2.1 modify training args
     training_args = TrainingArguments(
-        output_dir=config.output_dir,
-        run_name=None,
+        output_dir=output_dir,
+        run_name=config.experiment_name,
         remove_unused_columns=False,
         deepspeed="",
         gradient_checkpointing=False,
@@ -265,11 +400,14 @@ def main(config: ArgsConfig):
         max_steps=config.max_steps,
         save_strategy="steps",
         save_steps=config.save_steps,
-        # evaluation_strategy="no",
         save_total_limit=8,
         report_to=config.report_to,
         seed=42,
-        do_eval=False,
+        eval_strategy="no",
+        # eval_strategy="steps" if val_dataset is not None else "no",
+        # do_eval=val_dataset is not None,
+        # eval_steps=config.eval_steps if val_dataset is not None else None,
+        # load_best_model_at_end =True,
         ddp_find_unused_parameters=False,
         ddp_bucket_cap_mb=100,
         torch_compile_mode=None,
@@ -278,6 +416,7 @@ def main(config: ArgsConfig):
     # 2.2 run experiment
     experiment = TrainRunner(
         train_dataset=train_dataset,
+        eval_dataset=val_dataset,
         model=model,
         training_args=training_args,
         resume_from_checkpoint=config.resume,

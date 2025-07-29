@@ -28,6 +28,7 @@ from gr00t.model.policy import BasePolicy, Gr00tPolicy
 from gr00t.utils.eval import calc_mse_for_single_trajectory
 
 warnings.simplefilter("ignore", category=FutureWarning)
+warnings.filterwarnings('ignore', module='torchvision')
 
 """
 Example command:
@@ -84,6 +85,9 @@ class ArgsConfig:
 
     save_plot_path: str = None
     """Path to save the plot."""
+    
+    eval_episodes: List[int] = field(default_factory=lambda: [])
+    """episodes to run evaluations on"""
 
 
 def main(args: ArgsConfig):
@@ -145,7 +149,15 @@ def main(args: ArgsConfig):
     print("Running on all trajs with modality keys:", args.modality_keys)
 
     all_mse = []
-    for traj_id in range(args.trajs):
+    
+    if len(args.eval_episodes) > 0:
+        trajs = args.eval_episodes
+    else:
+        trajs = list(range(args.trajs))
+    # for traj_id in range(args.trajs):
+
+    
+    for traj_id in trajs:
         print("Running trajectory:", traj_id)
         mse = calc_mse_for_single_trajectory(
             policy,
@@ -155,7 +167,7 @@ def main(args: ArgsConfig):
             steps=args.steps,
             action_horizon=args.action_horizon,
             plot=args.plot,
-            save_plot_path=args.save_plot_path,
+            save_plot_path=f"{args.save_plot_path}_traj{traj_id}.png" if args.save_plot_path else None,
         )
         print("MSE:", mse)
         all_mse.append(mse)

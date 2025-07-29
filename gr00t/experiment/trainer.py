@@ -15,7 +15,9 @@
 
 
 import os
-from typing import Optional
+from typing import Optional, Dict, Union, Any, Tuple, List
+import logging 
+import sys
 
 import torch
 import transformers
@@ -151,3 +153,105 @@ class DualBrainTrainer(transformers.Trainer):
                 os.path.join(resume_from_checkpoint, TRAINER_STATE_NAME)
             )
         return super().train(resume_from_checkpoint, trial, ignore_keys_for_eval, **kwargs)
+
+    def prediction_step(
+        self,
+        model: torch.nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[list] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Perform a prediction step.
+        
+        Args:
+            model: The model to evaluate
+            inputs: The inputs for the model
+            prediction_loss_only: Whether to return only the loss
+            ignore_keys: Keys to ignore when computing the loss
+            
+        Returns:
+            Tuple of (loss, logits, labels)
+        """
+        has_labels = any(
+            inputs.get(k) is not None
+            for k in ["labels", "action", "action_mask"]
+        )
+        
+        # Move inputs to device
+        inputs = self._prepare_input(inputs)
+        
+        if ignore_keys is None:
+            ignore_keys = []
+
+        with torch.no_grad():
+            if has_labels:
+                # During evaluation, we want to compute loss
+                # Call model with inputs dict (not **inputs)
+                outputs = model(inputs)
+                
+                if isinstance(outputs, dict):
+                    loss = outputs.get("loss")
+                    # For GR00T, action predictions are in "action_pred" key
+                    logits = outputs.get("action_pred")
+                else:
+                    # Fallback if outputs is not a dict
+                    loss = None
+                    logits = outputs
+            else:
+                # During inference, we might not have labels
+                # Use get_action method if available (for inference)
+                if hasattr(model, 'get_action'):
+                    outputs = model.get_action(inputs)
+                    loss = None
+                    logits = outputs.get("action_pred") if isinstance(outputs, dict) else outputs
+                else:
+                    # Fallback to regular forward
+                    outputs = model(inputs)
+                    loss = outputs.get("loss") if isinstance(outputs, dict) else None
+                    logits = outputs.get("action_pred") if isinstance(outputs, dict) else outputs
+                    
+                    # print out the loss
+                    logging(f"eval batch loss: {loss.item():.6f}")
+
+        if prediction_loss_only:
+            return (loss, None, None)
+
+        # Extract labels - could be "action" or "labels"
+        labels = inputs.get("labels")
+        if labels is None:
+            labels = inputs.get("action")
+
+        # Remove ignored keys from outputs if needed
+        if logits is not None and isinstance(logits, dict):
+            logits = {k: v for k, v in logits.items() if k not in ignore_keys}
+
+        return (loss, logits, labels)
+    
+    def evaluation_loop(
+        self,
+        dataloader,
+        description: str,
+        prediction_loss_only: Optional[bool] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ):
+        """Override evaluation_loop to add custom logging."""
+        
+        print(f"=== Starting {description} ===", flush=True)
+        
+        # Call the parent evaluation_loop
+        result = super().evaluation_loop(
+            dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix
+        )
+        
+        # Extract and print the final eval loss
+        eval_loss = result.metrics.get(f"{metric_key_prefix}_loss")
+        if eval_loss is not None:
+            current_step = getattr(self.state, 'global_step', 'unknown')
+            print(f"=== EVALUATION COMPLETE ===", flush=True)
+            print(f"Step {current_step}: Final Eval Loss = {eval_loss:.6f}", flush=True)
+            print("=" * 40, flush=True)
+            sys.stdout.flush()
+        
+        return result
